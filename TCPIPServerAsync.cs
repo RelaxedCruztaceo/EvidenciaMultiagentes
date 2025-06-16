@@ -1,16 +1,19 @@
- using System.Collections;
+using System.Collections;
 using System.Collections.Generic;
 using UnityEngine;
 using System;
 using System.Net;
 using System.Net.Sockets;
 using System.Threading;
+using System.Linq;
 
 [System.Serializable]
 public class AgentData
 {
     public string id;
+    public string type;
     public Position position;
+    public string color;
 }
 
 [System.Serializable]
@@ -20,147 +23,302 @@ public class Position
     public float y;
 }
 
+[System.Serializable]
+public class SimulationData
+{
+    public AgentData[] agents;
+    public int step;
+    public string trafficLightState;
+    public int obstaclesRemoved;
+}
+
 public class TCPIPServerAsync : MonoBehaviour
 {
-    // Use this for initialization
-    System.Threading.Thread SocketThread;
-    volatile bool keepReading = false;
+    public int port = 1116;
+    public string ipAddress = "127.0.0.1";
     
-    // Dictionary to store agent cubes
-    private Dictionary<string, GameObject> agentCubes = new Dictionary<string, GameObject>();
+    public Material pedestrianMaterial;
+    public Material vehicleMaterial;
+    public Material authorityMaterial;
+    public Material obstacleMaterial;
     
-    // Queue for thread-safe communication between network thread and main thread
-    private Queue<AgentData> agentDataQueue = new Queue<AgentData>();
+    public float agentScale = 0.4f;
+    public float heightOffset = 0.0f;
+    
+    private Dictionary<string, GameObject> agentObjects = new Dictionary<string, GameObject>();
+    private Queue<SimulationData> dataQueue = new Queue<SimulationData>();
     private readonly object queueLock = new object();
     
-    // Cube prefab settings
-    public Material cubeMaterial;
-    public float cubeSize = 1.0f;
-    public float heightOffset = 0.0f; // Y position for the cubes
+    public UnityEngine.UI.Text stepText;
+    public UnityEngine.UI.Text trafficLightText;
+    public UnityEngine.UI.Text obstaclesText;
     
+    private GameObject[] loadedCarPrefabs;
+    private GameObject[] loadedObstaclePrefabs;
+    private GameObject copPrefab;
+    private GameObject pedestrianPrefab;
+    
+    private Thread SocketThread;
+    private volatile bool keepReading = false;
+    private Socket listener;
+    private Socket handler;
+
+    private float boundary = 25f;
+
     void Start()
     {
         Application.runInBackground = true;
-        
-        // Create a default material if none assigned
-        if (cubeMaterial == null)
+        CreateDefaultMaterials();
+        LoadAllPrefabs();
+        StartServer();
+    }
+
+    void LoadAllPrefabs()
+    {
+        loadedCarPrefabs = Resources.LoadAll<GameObject>("CarPrefabs");
+        loadedObstaclePrefabs = Resources.LoadAll<GameObject>("ObstaclePrefabs");
+        copPrefab = Resources.Load<GameObject>("cop");
+        pedestrianPrefab = Resources.Load<GameObject>("PersonModel");
+    }
+
+    void CreateDefaultMaterials()
+    {
+        if (pedestrianMaterial == null)
         {
-            cubeMaterial = new Material(Shader.Find("Standard"));
-            cubeMaterial.color = Color.blue;
+            pedestrianMaterial = new Material(Shader.Find("Standard"));
+            pedestrianMaterial.color = Color.blue;
         }
         
-        startServer();
+        if (vehicleMaterial == null)
+        {
+            vehicleMaterial = new Material(Shader.Find("Standard"));
+            vehicleMaterial.color = Color.red;
+        }
+        
+        if (authorityMaterial == null)
+        {
+            authorityMaterial = new Material(Shader.Find("Standard"));
+            authorityMaterial.color = Color.green;
+        }
+        
+        if (obstacleMaterial == null)
+        {
+            obstacleMaterial = new Material(Shader.Find("Standard"));
+            obstacleMaterial.color = new Color(0.6f, 0.3f, 0.1f);
+        }
     }
-    
+
     void Update()
     {
-        // Process agent data from the queue in the main thread
         lock (queueLock)
         {
-            while (agentDataQueue.Count > 0)
+            while (dataQueue.Count > 0)
             {
-                AgentData data = agentDataQueue.Dequeue();
-                UpdateAgentCube(data);
+                SimulationData data = dataQueue.Dequeue();
+                ProcessSimulationData(data);
+            }
+        }
+
+        CheckVehicleBoundaries();
+    }
+
+    void CheckVehicleBoundaries()
+    {
+        List<string> vehiclesToRemove = new List<string>();
+        
+        foreach (var pair in agentObjects)
+        {
+            if (pair.Value != null && pair.Value.name.Contains("vehicle"))
+            {
+                Vector3 position = pair.Value.transform.position;
+                if (Mathf.Abs(position.x) > boundary || Mathf.Abs(position.z) > boundary)
+                {
+                    vehiclesToRemove.Add(pair.Key);
+                }
+            }
+        }
+
+        foreach (string vehicleId in vehiclesToRemove)
+        {
+            if (agentObjects.ContainsKey(vehicleId))
+            {
+                Destroy(agentObjects[vehicleId]);
+                agentObjects.Remove(vehicleId);
             }
         }
     }
-    
-    void UpdateAgentCube(AgentData data)
+
+    void ProcessSimulationData(SimulationData data)
     {
-        GameObject cube;
-        
-        if (agentCubes.ContainsKey(data.id))
+        if (stepText != null) stepText.text = "Paso: " + data.step;
+        if (trafficLightText != null) 
+            trafficLightText.text = data.trafficLightState == "horizontal_green" ? "HORIZONTALES VERDE" : "VERTICALES VERDE";
+        if (obstaclesText != null) obstaclesText.text = "Obstáculos: " + data.obstaclesRemoved;
+
+        HashSet<string> currentAgentIds = new HashSet<string>(data.agents.Select(a => a.id));
+
+        List<string> agentsToRemove = new List<string>();
+        foreach (var agentId in agentObjects.Keys)
         {
-            cube = agentCubes[data.id];
+            if (!currentAgentIds.Contains(agentId))
+            {
+                Destroy(agentObjects[agentId]);
+                agentsToRemove.Add(agentId);
+            }
+        }
+        foreach (var agentId in agentsToRemove)
+        {
+            agentObjects.Remove(agentId);
+        }
+
+        foreach (AgentData agentData in data.agents)
+        {
+            UpdateOrCreateAgent(agentData);
+        }
+    }
+
+    void UpdateOrCreateAgent(AgentData agentData)
+    {
+        GameObject agentObject;
+        bool isNew = false;
+        Vector3 newPosition = new Vector3(agentData.position.x, heightOffset, agentData.position.y);
+
+        if (agentObjects.ContainsKey(agentData.id))
+        {
+            agentObject = agentObjects[agentData.id];
+            
+            Vector3 direction = newPosition - agentObject.transform.position;
+            if (direction != Vector3.zero)
+            {
+                agentObject.transform.rotation = Quaternion.LookRotation(direction);
+            }
         }
         else
         {
-            cube = GameObject.CreatePrimitive(PrimitiveType.Cube);
-            cube.name = data.id;
-            cube.transform.localScale = Vector3.one * cubeSize;
-            
-            // Apply material
-            Renderer renderer = cube.GetComponent<Renderer>();
-            renderer.material = cubeMaterial;
-            
-            Color randomColor = new Color(
-                UnityEngine.Random.Range(0.3f, 1.0f),
-                UnityEngine.Random.Range(0.3f, 1.0f),
-                UnityEngine.Random.Range(0.3f, 1.0f)
-            );
-            renderer.material.color = randomColor;
-            
-            agentCubes[data.id] = cube;
-            Debug.Log($"Created cube for {data.id}");
+            switch (agentData.type)
+            {
+                case "pedestrian":
+                    agentObject = pedestrianPrefab != null ? 
+                        Instantiate(pedestrianPrefab) : 
+                        GameObject.CreatePrimitive(PrimitiveType.Capsule);
+                    agentObject.transform.localScale = Vector3.one * agentScale;
+                    break;
+                    
+                case "vehicle":
+                    if (loadedCarPrefabs != null && loadedCarPrefabs.Length > 0)
+                    {
+                        int randomIndex = UnityEngine.Random.Range(0, loadedCarPrefabs.Length);
+                        agentObject = Instantiate(loadedCarPrefabs[randomIndex]);
+                        agentObject.transform.localScale = Vector3.one * agentScale;
+                    }
+                    else
+                    {
+                        agentObject = GameObject.CreatePrimitive(PrimitiveType.Cube);
+                    }
+                    agentObject.name = "vehicle_" + agentData.id;
+                    break;
+                    
+                case "authority":
+                    if (copPrefab != null)
+                    {
+                        agentObject = Instantiate(copPrefab);
+                        agentObject.transform.localScale = Vector3.one * agentScale;
+                    }
+                    else
+                    {
+                        agentObject = GameObject.CreatePrimitive(PrimitiveType.Capsule);
+                        agentObject.transform.localScale = Vector3.one * agentScale * 1.5f;
+                    }
+                    break;
+                    
+                case "obstacle":
+                    if (loadedObstaclePrefabs != null && loadedObstaclePrefabs.Length > 0)
+                    {
+                        int randomIndex = UnityEngine.Random.Range(0, loadedObstaclePrefabs.Length);
+                        agentObject = Instantiate(loadedObstaclePrefabs[randomIndex]);
+                        agentObject.transform.localScale = Vector3.one * agentScale * 1.5f;
+                    }
+                    else
+                    {
+                        agentObject = GameObject.CreatePrimitive(PrimitiveType.Cube);
+                    }
+                    break;
+                    
+                default:
+                    agentObject = GameObject.CreatePrimitive(PrimitiveType.Cube);
+                    break;
+            }
+
+            agentObject.name = agentData.id;
+            agentObjects[agentData.id] = agentObject;
+            isNew = true;
         }
-        
-        Vector3 newPosition = new Vector3(data.position.x, heightOffset, data.position.y);
-        cube.transform.position = newPosition;
+
+        agentObject.transform.position = newPosition;
+
+        if (isNew && agentObject.GetComponent<Renderer>() != null)
+        {
+            Material materialToUse = obstacleMaterial;
+            
+            switch (agentData.type)
+            {
+                case "pedestrian":
+                    materialToUse = pedestrianMaterial;
+                    break;
+                case "vehicle":
+                    materialToUse = vehicleMaterial;
+                    break;
+                case "authority":
+                    materialToUse = authorityMaterial;
+                    break;
+            }
+
+            if (!string.IsNullOrEmpty(agentData.color))
+            {
+                if (ColorUtility.TryParseHtmlString(agentData.color, out Color color))
+                {
+                    materialToUse = new Material(materialToUse);
+                    materialToUse.color = color;
+                }
+            }
+            agentObject.GetComponent<Renderer>().material = materialToUse;
+        }
     }
-    
-    void startServer()
+
+    void StartServer()
     {
-        SocketThread = new System.Threading.Thread(networkCode);
+        SocketThread = new Thread(NetworkCode);
         SocketThread.IsBackground = true;
         SocketThread.Start();
     }
-    
-    private string getIPAddress()
-    {
-        IPHostEntry host;
-        string localIP = "";
-        host = Dns.GetHostEntry(Dns.GetHostName());
-        foreach (IPAddress ip in host.AddressList)
-        {
-            if (ip.AddressFamily == AddressFamily.InterNetwork)
-            {
-                localIP = ip.ToString();
-            }
-        }
-        return localIP;
-    }
-    
-    Socket listener;
-    Socket handler;
-    
-    void networkCode()
+
+    void NetworkCode()
     {
         string data;
-        // Data buffer for incoming data.
-        byte[] bytes = new Byte[1024];
-        
-        // host running the application.
-        // Create EndPoint
-        IPAddress IPAdr = IPAddress.Parse("127.0.0.1"); // Dirección IP
-        IPEndPoint localEndPoint = new IPEndPoint(IPAdr, 1114);
-        
-        // Create a TCP/IP socket.
+        byte[] bytes = new Byte[1024 * 1024];
+
+        IPAddress ip = IPAddress.Parse(ipAddress);
+        IPEndPoint localEndPoint = new IPEndPoint(ip, port);
+
         listener = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
-        
-        // Bind the socket to the local endpoint and
-        // listen for incoming connections.
+
         try
         {
             listener.Bind(localEndPoint);
             listener.Listen(10);
-            
-            // Start listening for connections.
+
             while (true)
             {
                 keepReading = true;
-                // Program is suspended while waiting for an incoming connection.
-                Debug.Log("Waiting for Connection");
                 handler = listener.Accept();
-                Debug.Log("Client Connected");
-                
+
                 data = "";
-                byte[] SendBytes = System.Text.Encoding.Default.GetBytes("I will send key");
-                handler.Send(SendBytes); // dar al cliente
-                
-                // An incoming connection needs to be processed.
+                byte[] welcomeBytes = System.Text.Encoding.ASCII.GetBytes("Unity Traffic Visualization Server Ready");
+                handler.Send(welcomeBytes);
+
                 while (keepReading)
                 {
-                    bytes = new byte[1024];
+                    bytes = new byte[1024 * 1024];
                     int bytesRec = handler.Receive(bytes);
                     if (bytesRec <= 0)
                     {
@@ -168,21 +326,31 @@ public class TCPIPServerAsync : MonoBehaviour
                         handler.Disconnect(true);
                         break;
                     }
-                    
+
                     data += System.Text.Encoding.ASCII.GetString(bytes, 0, bytesRec);
-                    Debug.Log("Received from Client: " + data);
                     
-                    if (data.IndexOf("$") > -1)
+                    while (data.Contains("$"))
                     {
-                        // Remove the delimiter and process the JSON
-                        string jsonData = data.Replace("$", "");
-                        ProcessAgentData(jsonData);
-                        data = ""; // Reset data for next message
-                        break;
+                        int delimiterIndex = data.IndexOf("$");
+                        string jsonData = data.Substring(0, delimiterIndex);
+                        data = data.Substring(delimiterIndex + 1);
+
+                        try
+                        {
+                            SimulationData simData = JsonUtility.FromJson<SimulationData>(jsonData);
+                            lock (queueLock)
+                            {
+                                dataQueue.Enqueue(simData);
+                            }
+                        }
+                        catch (Exception e)
+                        {
+                            Debug.LogError("Error parsing JSON: " + e.Message);
+                        }
                     }
-                    System.Threading.Thread.Sleep(1);
+                    Thread.Sleep(1);
                 }
-                System.Threading.Thread.Sleep(1);
+                Thread.Sleep(1);
             }
         }
         catch (Exception e)
@@ -190,58 +358,19 @@ public class TCPIPServerAsync : MonoBehaviour
             Debug.Log(e.ToString());
         }
     }
-    
-    void ProcessAgentData(string jsonData)
-    {
-        try
-        {
-            AgentData agentData = JsonUtility.FromJson<AgentData>(jsonData);
-            
-            // Add to queue for processing in main thread
-            lock (queueLock)
-            {
-                agentDataQueue.Enqueue(agentData);
-            }
-            
-            Debug.Log($"Processed data for {agentData.id}: ({agentData.position.x}, {agentData.position.y})");
-        }
-        catch (Exception e)
-        {
-            Debug.LogError("Error parsing JSON: " + e.Message);
-            Debug.LogError("JSON data: " + jsonData);
-        }
-    }
-    
-    void stopServer()
+
+    void StopServer()
     {
         keepReading = false;
-        // stop thread
-        if (SocketThread != null)
-        {
-            SocketThread.Abort();
-        }
-        if (handler != null && handler.Connected)
-        {
-            handler.Disconnect(false);
-            Debug.Log("Disconnected!");
-        }
+        if (SocketThread != null) SocketThread.Abort();
+        if (handler != null && handler.Connected) handler.Disconnect(false);
     }
-    
-    void OnDisable()
-    {
-        stopServer();
-    }
-    
+
+    void OnDisable() => StopServer();
+
     void OnDestroy()
     {
-        // Clean up created cubes
-        foreach (var cube in agentCubes.Values)
-        {
-            if (cube != null)
-            {
-                Destroy(cube);
-            }
-        }
-        agentCubes.Clear();
+        foreach (var obj in agentObjects.Values) if (obj != null) Destroy(obj);
+        agentObjects.Clear();
     }
 }
